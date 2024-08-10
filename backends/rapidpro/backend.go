@@ -29,7 +29,7 @@ import (
 	"github.com/nyaruka/gocommon/dbutil"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/jsonx"
-	"github.com/nyaruka/gocommon/storage"
+	"github.com/nyaruka/gocommon/s3x"
 	"github.com/nyaruka/gocommon/syncx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
@@ -45,9 +45,6 @@ const sentSetName = "msgs_sent_%s"
 // our timeout for backend operations
 const backendTimeout = time.Second * 20
 
-// storage directory (only used with file system storage)
-var storageDir = "_storage"
-
 var uuidRegex = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 
 func init() {
@@ -62,10 +59,9 @@ type backend struct {
 	stLogWriter  *StorageLogWriter // attached logs being written to storage
 	writerWG     *sync.WaitGroup
 
-	db                *sqlx.DB
-	redisPool         *redis.Pool
-	attachmentStorage storage.Storage
-	logStorage        storage.Storage
+	db *sqlx.DB
+	rp *redis.Pool
+	s3 *s3x.Service
 
 	channelsByUUID *cache.Local[courier.ChannelUUID, *Channel]
 	channelsByAddr *cache.Local[courier.ChannelAddress, *Channel]
@@ -157,7 +153,7 @@ func (b *backend) Start() error {
 		log.Info("db ok")
 	}
 
-	b.redisPool, err = redisx.NewPool(b.config.Redis)
+	b.rp, err = redisx.NewPool(b.config.Redis)
 	if err != nil {
 		log.Error("redis not reachable", "error", err)
 	} else {
@@ -166,52 +162,32 @@ func (b *backend) Start() error {
 
 	// start our dethrottler if we are going to be doing some sending
 	if b.config.MaxWorkers > 0 {
-		queue.StartDethrottler(b.redisPool, b.stopChan, b.waitGroup, msgQueueName)
+		queue.StartDethrottler(b.rp, b.stopChan, b.waitGroup, msgQueueName)
 	}
 
-	// create our storage (S3 or file system)
-	if b.config.AWSAccessKeyID != "" || b.config.AWSUseCredChain {
-		s3config := &storage.S3Options{
-			AWSAccessKeyID:     b.config.AWSAccessKeyID,
-			AWSSecretAccessKey: b.config.AWSSecretAccessKey,
-			Endpoint:           b.config.S3Endpoint,
-			Region:             b.config.S3Region,
-			DisableSSL:         b.config.S3DisableSSL,
-			ForcePathStyle:     b.config.S3ForcePathStyle,
-			MaxRetries:         3,
-		}
-		if b.config.AWSAccessKeyID != "" && !b.config.AWSUseCredChain {
-			s3config.AWSAccessKeyID = b.config.AWSAccessKeyID
-			s3config.AWSSecretAccessKey = b.config.AWSSecretAccessKey
-		}
-		s3Client, err := storage.NewS3Client(s3config)
-		if err != nil {
-			return err
-		}
-		b.attachmentStorage = storage.NewS3(s3Client, b.config.S3AttachmentsBucket, b.config.S3Region, s3.BucketCannedACLPublicRead, 32)
-		b.logStorage = storage.NewS3(s3Client, b.config.S3LogsBucket, b.config.S3Region, s3.BucketCannedACLPrivate, 32)
+	// setup S3 storage
+	b.s3, err = s3x.NewService(b.config.AWSAccessKeyID, b.config.AWSSecretAccessKey, b.config.AWSRegion, b.config.S3Endpoint, b.config.S3Minio)
+	if err != nil {
+		return err
+	}
+
+	// check bucket access
+	if err := b.s3.Test(ctx, b.config.S3AttachmentsBucket); err != nil {
+		log.Error("attachments bucket not accessible", "error", err)
 	} else {
-		b.attachmentStorage = storage.NewFS(storageDir+"/attachments", 0766)
-		b.logStorage = storage.NewFS(storageDir+"/logs", 0766)
+		log.Info("attachments bucket ok")
+	}
+	if err := b.s3.Test(ctx, b.config.S3LogsBucket); err != nil {
+		log.Error("logs bucket not accessible", "error", err)
+	} else {
+		log.Info("logs bucket ok")
 	}
 
 	// create and start channel caches...
-	b.channelsByUUID = cache.NewLocal[courier.ChannelUUID, *Channel](b.loadChannelByUUID, time.Minute)
+	b.channelsByUUID = cache.NewLocal(b.loadChannelByUUID, time.Minute)
 	b.channelsByUUID.Start()
-	b.channelsByAddr = cache.NewLocal[courier.ChannelAddress, *Channel](b.loadChannelByAddress, time.Minute)
+	b.channelsByAddr = cache.NewLocal(b.loadChannelByAddress, time.Minute)
 	b.channelsByAddr.Start()
-
-	// check our storages
-	if err := checkStorage(b.attachmentStorage); err != nil {
-		log.Error(b.attachmentStorage.Name()+" attachment storage not available", "error", err)
-	} else {
-		log.Info(b.attachmentStorage.Name() + " attachment storage ok")
-	}
-	if err := checkStorage(b.logStorage); err != nil {
-		log.Error(b.logStorage.Name()+" log storage not available", "error", err)
-	} else {
-		log.Info(b.logStorage.Name() + " log storage ok")
-	}
 
 	// make sure our spool dirs are writable
 	err = courier.EnsureSpoolDirPresent(b.config.SpoolDir, "msgs")
@@ -234,7 +210,7 @@ func (b *backend) Start() error {
 	b.dbLogWriter = NewDBLogWriter(b.db, b.writerWG)
 	b.dbLogWriter.Start()
 
-	b.stLogWriter = NewStorageLogWriter(b.logStorage, b.writerWG)
+	b.stLogWriter = NewStorageLogWriter(b.s3, b.config.S3LogsBucket, b.writerWG)
 	b.stLogWriter.Start()
 
 	// register and start our spool flushers
@@ -278,7 +254,7 @@ func (b *backend) Cleanup() error {
 	if b.db != nil {
 		b.db.Close()
 	}
-	return b.redisPool.Close()
+	return b.rp.Close()
 }
 
 // GetChannel returns the channel for the passed in type and UUID
@@ -363,7 +339,7 @@ func (b *backend) DeleteMsgByExternalID(ctx context.Context, channel courier.Cha
 	}
 
 	if msgID != courier.NilMsgID && contactID != NilContactID {
-		rc := b.redisPool.Get()
+		rc := b.rp.Get()
 		defer rc.Close()
 
 		if err := queueMsgDeleted(rc, ch, msgID, contactID); err != nil {
@@ -396,7 +372,7 @@ func (b *backend) NewIncomingMsg(channel courier.Channel, urn urns.URN, text str
 // PopNextOutgoingMsg pops the next message that needs to be sent
 func (b *backend) PopNextOutgoingMsg(ctx context.Context) (courier.MsgOut, error) {
 	// pop the next message off our queue
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 
 	token, msgJSON, err := queue.PopFromQueue(rc, msgQueueName)
@@ -451,7 +427,7 @@ var luaSent = redis.NewScript(3,
 
 // WasMsgSent returns whether the passed in message has already been sent
 func (b *backend) WasMsgSent(ctx context.Context, id courier.MsgID) (bool, error) {
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 
 	todayKey := fmt.Sprintf(sentSetName, time.Now().UTC().Format("2006_01_02"))
@@ -466,7 +442,7 @@ var luaClearSent = redis.NewScript(3,
 `)
 
 func (b *backend) ClearMsgSent(ctx context.Context, id courier.MsgID) error {
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 
 	todayKey := fmt.Sprintf(sentSetName, time.Now().UTC().Format("2006_01_02"))
@@ -477,7 +453,7 @@ func (b *backend) ClearMsgSent(ctx context.Context, id courier.MsgID) error {
 
 // MarkOutgoingMsgComplete marks the passed in message as having completed processing, freeing up a worker for that channel
 func (b *backend) MarkOutgoingMsgComplete(ctx context.Context, msg courier.MsgOut, status courier.StatusUpdate) {
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 
 	dbMsg := msg.(*Msg)
@@ -543,7 +519,7 @@ func (b *backend) WriteStatusUpdate(ctx context.Context, status courier.StatusUp
 	if status.MsgID() != courier.NilMsgID {
 		// this is a message we've just sent and were given an external id for
 		if status.ExternalID() != "" {
-			rc := b.redisPool.Get()
+			rc := b.rp.Get()
 			defer rc.Close()
 
 			err := b.sentExternalIDs.Set(rc, fmt.Sprintf("%d|%s", su.ChannelID_, su.ExternalID_), fmt.Sprintf("%d", status.MsgID()))
@@ -641,27 +617,23 @@ func (b *backend) WriteChannelEvent(ctx context.Context, event courier.ChannelEv
 
 // WriteChannelLog persists the passed in log to our database, for rapidpro we swallow all errors, logging isn't critical
 func (b *backend) WriteChannelLog(ctx context.Context, clog *courier.ChannelLog) error {
-	timeout, cancel := context.WithTimeout(ctx, backendTimeout)
-	defer cancel()
-
-	queueChannelLog(timeout, b, clog)
-
+	queueChannelLog(b, clog)
 	return nil
 }
 
 // SaveAttachment saves an attachment to backend storage
 func (b *backend) SaveAttachment(ctx context.Context, ch courier.Channel, contentType string, data []byte, extension string) (string, error) {
 	// create our filename
-	filename := string(uuids.New())
+	filename := string(uuids.NewV4())
 	if extension != "" {
 		filename = fmt.Sprintf("%s.%s", filename, extension)
 	}
 
 	orgID := ch.(*Channel).OrgID()
 
-	path := filepath.Join(b.config.S3AttachmentsPrefix, strconv.FormatInt(int64(orgID), 10), filename[:4], filename[4:8], filename)
+	path := filepath.Join("attachments", strconv.FormatInt(int64(orgID), 10), filename[:4], filename[4:8], filename)
 
-	storageURL, err := b.attachmentStorage.Put(ctx, path, contentType, data)
+	storageURL, err := b.s3.PutObject(ctx, b.config.S3AttachmentsBucket, path, contentType, data, s3.BucketCannedACLPublicRead)
 	if err != nil {
 		return "", fmt.Errorf("error saving attachment to storage (bytes=%d): %w", len(data), err)
 	}
@@ -679,14 +651,14 @@ func (b *backend) ResolveMedia(ctx context.Context, mediaUrl string) (courier.Me
 	mediaUUID := uuidRegex.FindString(u.Path)
 
 	// if hostname isn't our media domain, or path doesn't contain a UUID, don't try to resolve
-	if strings.Replace(u.Hostname(), fmt.Sprintf("%s.", b.config.S3Region), "", -1) != b.config.MediaDomain || mediaUUID == "" {
+	if strings.Replace(u.Hostname(), fmt.Sprintf("%s.", b.config.AWSRegion), "", -1) != b.config.MediaDomain || mediaUUID == "" {
 		return nil, nil
 	}
 
 	unlock := b.mediaMutexes.Lock(mediaUUID)
 	defer unlock()
 
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 
 	var media *Media
@@ -708,7 +680,7 @@ func (b *backend) ResolveMedia(ctx context.Context, mediaUrl string) (courier.Me
 	}
 
 	// if we found a media record but it doesn't match the URL, don't use it
-	if media == nil || (media.URL() != mediaUrl && media.URL() != strings.Replace(mediaUrl, fmt.Sprintf("%s.", b.config.S3Region), "", -1)) {
+	if media == nil || (media.URL() != mediaUrl && media.URL() != strings.Replace(mediaUrl, fmt.Sprintf("%s.", b.config.AWSRegion), "", -1)) {
 		return nil, nil
 	}
 
@@ -729,7 +701,7 @@ func (b *backend) HttpAccess() *httpx.AccessConfig {
 // Health returns the health of this backend as a string, returning "" if all is well
 func (b *backend) Health() string {
 	// test redis
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 	_, redisErr := rc.Do("PING")
 
@@ -751,7 +723,7 @@ func (b *backend) Health() string {
 
 // Heartbeat is called every minute, we log our queue depth to librato
 func (b *backend) Heartbeat() error {
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 
 	active, err := redis.Strings(rc.Do("ZRANGE", fmt.Sprintf("%s:active", msgQueueName), "0", "-1"))
@@ -784,7 +756,7 @@ func (b *backend) Heartbeat() error {
 
 	// get our DB and redis stats
 	dbStats := b.db.Stats()
-	redisStats := b.redisPool.Stats()
+	redisStats := b.rp.Stats()
 
 	dbWaitDurationInPeriod := dbStats.WaitDuration - b.dbWaitDuration
 	dbWaitCountInPeriod := dbStats.WaitCount - b.dbWaitCount
@@ -819,7 +791,7 @@ func (b *backend) Heartbeat() error {
 
 // Status returns information on our queue sizes, number of workers etc..
 func (b *backend) Status() string {
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 
 	status := bytes.Buffer{}
@@ -888,12 +860,5 @@ func (b *backend) Status() string {
 
 // RedisPool returns the redisPool for this backend
 func (b *backend) RedisPool() *redis.Pool {
-	return b.redisPool
-}
-
-func checkStorage(s storage.Storage) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	err := s.Test(ctx)
-	cancel()
-	return err
+	return b.rp
 }

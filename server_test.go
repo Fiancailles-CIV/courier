@@ -60,7 +60,7 @@ func TestServerURLs(t *testing.T) {
 	// can't access status page without auth
 	statusCode, respBody = request("GET", "http://localhost:8081/status", "", "")
 	assert.Equal(t, 401, statusCode)
-	assert.Contains(t, respBody, "Unauthorized")
+	assert.Equal(t, respBody, "Unauthorized")
 
 	// can access status page without auth
 	statusCode, respBody = request("GET", "http://localhost:8081/status", "admin", "password123")
@@ -70,12 +70,12 @@ func TestServerURLs(t *testing.T) {
 	// can't access status page with wrong method
 	statusCode, respBody = request("POST", "http://localhost:8081/status", "admin", "password123")
 	assert.Equal(t, 405, statusCode)
-	assert.Contains(t, respBody, "Method Not Allowed")
+	assert.Equal(t, respBody, "{\"message\":\"Method Not Allowed\",\"data\":[{\"type\":\"error\",\"error\":\"method not allowed: POST\"}]}\n")
 
 	// can't access non-existent page
 	statusCode, respBody = request("POST", "http://localhost:8081/nothere", "admin", "password123")
 	assert.Equal(t, 404, statusCode)
-	assert.Contains(t, respBody, "not found")
+	assert.Equal(t, respBody, "{\"message\":\"Not Found\",\"data\":[{\"type\":\"error\",\"error\":\"not found: /nothere\"}]}\n")
 }
 
 func TestIncoming(t *testing.T) {
@@ -93,6 +93,11 @@ func TestIncoming(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(body), "missing from or text")
 
+	assert.Len(t, mb.WrittenChannelLogs(), 1)
+	clog := mb.WrittenChannelLogs()[0]
+	assert.False(t, clog.Attached())
+	assert.Len(t, clog.HTTPLogs(), 1)
+
 	req, _ := http.NewRequest("GET", "http://localhost:8081/c/mck/e4bb1578-29da-4fa5-a214-9da19dd24230/receive?from=2065551212&text=hello", nil)
 	req.Header.Set("Cookie", "secret")
 	resp, err = http.DefaultClient.Do(req)
@@ -102,6 +107,11 @@ func TestIncoming(t *testing.T) {
 	defer resp.Body.Close()
 	body, _ = io.ReadAll(resp.Body)
 	assert.Contains(t, string(body), "ok")
+
+	assert.Len(t, mb.WrittenChannelLogs(), 2)
+	clog = mb.WrittenChannelLogs()[1]
+	assert.True(t, clog.Attached())
+	assert.Len(t, clog.HTTPLogs(), 1)
 }
 
 func TestOutgoing(t *testing.T) {
@@ -153,7 +163,7 @@ func TestOutgoing(t *testing.T) {
 	assert.Len(t, mb.WrittenChannelLogs(), 1)
 	clog := mb.WrittenChannelLogs()[0]
 	assert.Equal(t, []*courier.ChannelError{courier.NewChannelError("seeds", "", "contains ********** seeds")}, clog.Errors())
-
+	assert.True(t, clog.Attached())
 	assert.Len(t, clog.HTTPLogs(), 1)
 
 	hlog := clog.HTTPLogs()[0]
@@ -231,7 +241,7 @@ func TestFetchAttachment(t *testing.T) {
 	httpx.SetRequestor(httpMocks)
 
 	defer uuids.SetGenerator(uuids.DefaultGenerator)
-	uuids.SetGenerator(uuids.NewSeededGenerator(1234))
+	uuids.SetGenerator(uuids.NewSeededGenerator(1234, time.Now))
 
 	logger := slog.Default()
 	config := courier.NewDefaultConfig()

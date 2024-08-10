@@ -1,3 +1,54 @@
+v9.3.4 (2024-08-07)
+-------------------------
+ * Fix FCM authentication config retrieve to expect map[string]string
+ * Remove old code no longer used
+
+v9.3.3 (2024-08-02)
+-------------------------
+ * Update to latest gocommon
+
+v9.3.2 (2024-07-29)
+-------------------------
+ * Replace storage usage for logs
+
+v9.3.1 (2024-07-29)
+-------------------------
+ * Switch to s3x for attachments to get correct urls when using minio
+ * Update FCM handler to use google auth to generate bearer tokens
+
+v9.3.0 (2024-07-25)
+-------------------------
+ * Support minio for local dev enviroment and CI
+ * Update AWS/S3 configs
+
+v9.2.1 (2024-07-23)
+-------------------------
+ * Fix unnecessarily writing send channel logs to the database
+
+v9.2.0 (2024-07-17)
+-------------------------
+ * Update README
+
+v9.1.53 (2024-07-15)
+-------------------------
+ * Update deps
+
+v9.1.52 (2024-07-10)
+-------------------------
+ * Start writing msgs_msg.is_android
+
+v9.1.51 (2024-07-01)
+-------------------------
+ * Update deps
+
+v9.1.50 (2024-06-20)
+-------------------------
+ * Update chi library
+
+v9.1.49 (2024-06-17)
+-------------------------
+ * Adjust WA template to be send if present even when we have attachments
+
 v9.1.48 (2024-06-14)
 -------------------------
  * Fix legacy WA components parameters

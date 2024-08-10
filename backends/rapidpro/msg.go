@@ -107,7 +107,7 @@ func newMsg(direction MsgDirection, channel courier.Channel, urn urns.URN, text 
 
 	return &Msg{
 		OrgID_:        dbChannel.OrgID(),
-		UUID_:         courier.MsgUUID(uuids.New()),
+		UUID_:         courier.MsgUUID(uuids.NewV4()),
 		Direction_:    direction,
 		Status_:       courier.MsgStatusPending,
 		Visibility_:   MsgVisible,
@@ -245,9 +245,9 @@ func writeMsg(ctx context.Context, b *backend, msg courier.MsgIn, clog *courier.
 
 const sqlInsertMsg = `
 INSERT INTO
-	msgs_msg(org_id, uuid, direction, text, attachments, msg_type, msg_count, error_count, high_priority, status,
+	msgs_msg(org_id, uuid, direction, text, attachments, msg_type, msg_count, error_count, high_priority, status, is_android,
              visibility, external_id, channel_id, contact_id, contact_urn_id, created_on, modified_on, next_attempt, sent_on, log_uuids)
-    VALUES(:org_id, :uuid, :direction, :text, :attachments, 'T', :msg_count, :error_count, :high_priority, :status,
+    VALUES(:org_id, :uuid, :direction, :text, :attachments, 'T', :msg_count, :error_count, :high_priority, :status, FALSE,
            :visibility, :external_id, :channel_id, :contact_id, :contact_urn_id, :created_on, :modified_on, :next_attempt, :sent_on, :log_uuids)
 RETURNING id`
 
@@ -276,7 +276,7 @@ func writeMsgToDB(ctx context.Context, b *backend, m *Msg, clog *courier.Channel
 	}
 
 	// queue this up to be handled by RapidPro
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 	err = queueMsgHandling(rc, contact, m)
 
@@ -328,7 +328,7 @@ func (b *backend) flushMsgFile(filename string, contents []byte) error {
 
 // checks to see if this message has already been received and if so returns its UUID
 func (b *backend) checkMsgAlreadyReceived(msg *Msg) courier.MsgUUID {
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 
 	// if we have an external id use that
@@ -358,7 +358,7 @@ func (b *backend) checkMsgAlreadyReceived(msg *Msg) courier.MsgUUID {
 
 // records that the given message has been received and written to the database
 func (b *backend) recordMsgReceived(msg *Msg) {
-	rc := b.redisPool.Get()
+	rc := b.rp.Get()
 	defer rc.Close()
 
 	if msg.ExternalID_ != "" {

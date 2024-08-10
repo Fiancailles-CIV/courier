@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/buger/jsonparser"
 	"github.com/gomodule/redigo/redis"
 	"github.com/lib/pq"
@@ -42,12 +44,19 @@ func testConfig() *courier.Config {
 	config.DB = "postgres://courier_test:temba@localhost:5432/courier_test?sslmode=disable"
 	config.Redis = "redis://localhost:6379/0"
 	config.MediaDomain = "nyaruka.s3.com"
+
+	// configure S3 to use a local minio instance
+	config.AWSAccessKeyID = "root"
+	config.AWSSecretAccessKey = "tembatemba"
+	config.S3Endpoint = "http://localhost:9000"
+	config.S3AttachmentsBucket = "test-attachments"
+	config.S3LogsBucket = "test-attachments"
+	config.S3Minio = true
+
 	return config
 }
 
 func (ts *BackendTestSuite) SetupSuite() {
-	storageDir = "_test_storage"
-
 	// turn off logging
 	log.SetOutput(io.Discard)
 
@@ -76,6 +85,9 @@ func (ts *BackendTestSuite) SetupSuite() {
 	}
 	ts.b.db.MustExec(string(sql))
 
+	ts.b.s3.Client.CreateBucket(&s3.CreateBucketInput{Bucket: aws.String("test-attachments")})
+	ts.b.s3.Client.CreateBucket(&s3.CreateBucketInput{Bucket: aws.String("test-logs")})
+
 	ts.clearRedis()
 }
 
@@ -83,14 +95,13 @@ func (ts *BackendTestSuite) TearDownSuite() {
 	ts.b.Stop()
 	ts.b.Cleanup()
 
-	if err := os.RemoveAll(storageDir); err != nil {
-		panic(err)
-	}
+	ts.b.s3.EmptyBucket(context.Background(), "test-attachments")
+	ts.b.s3.EmptyBucket(context.Background(), "test-logs")
 }
 
 func (ts *BackendTestSuite) clearRedis() {
 	// clear redis
-	r := ts.b.redisPool.Get()
+	r := ts.b.rp.Get()
 	defer r.Close()
 	_, err := r.Do("FLUSHDB")
 	ts.Require().NoError(err)
@@ -691,7 +702,7 @@ func (ts *BackendTestSuite) TestMsgStatus() {
 }
 
 func (ts *BackendTestSuite) TestSentExternalIDCaching() {
-	rc := ts.b.redisPool.Get()
+	rc := ts.b.rp.Get()
 	defer rc.Close()
 
 	ctx := context.Background()
@@ -741,7 +752,7 @@ func (ts *BackendTestSuite) TestHeartbeat() {
 }
 
 func (ts *BackendTestSuite) TestCheckForDuplicate() {
-	rc := ts.b.redisPool.Get()
+	rc := ts.b.rp.Get()
 	defer rc.Close()
 
 	ctx := context.Background()
@@ -821,7 +832,7 @@ func (ts *BackendTestSuite) TestStatus() {
 	ts.True(strings.Contains(ts.b.Status(), "Channel"), ts.b.Status())
 
 	// add a message to our queue
-	r := ts.b.redisPool.Get()
+	r := ts.b.rp.Get()
 	defer r.Close()
 
 	dbMsg := readMsgFromDB(ts.b, 10000)
@@ -842,7 +853,7 @@ func (ts *BackendTestSuite) TestStatus() {
 func (ts *BackendTestSuite) TestOutgoingQueue() {
 	// add one of our outgoing messages to the queue
 	ctx := context.Background()
-	r := ts.b.redisPool.Get()
+	r := ts.b.rp.Get()
 	defer r.Close()
 
 	dbMsg := readMsgFromDB(ts.b, 10000)
@@ -1035,7 +1046,7 @@ func (ts *BackendTestSuite) TestWriteChanneLog() {
 
 	time.Sleep(time.Second) // give writer time to write this
 
-	_, body, err := ts.b.logStorage.Get(context.Background(), fmt.Sprintf("channels/%s/%s/%s.json", channel.UUID(), clog2.UUID()[0:4], clog2.UUID()))
+	_, body, err := ts.b.s3.GetObject(context.Background(), ts.b.config.S3LogsBucket, fmt.Sprintf("channels/%s/%s/%s.json", channel.UUID(), clog2.UUID()[0:4], clog2.UUID()))
 	ts.NoError(err)
 	ts.Contains(string(body), "msg_send")
 	ts.Contains(string(body), "https://api.messages.com/send.json")
@@ -1082,11 +1093,11 @@ func (ts *BackendTestSuite) TestSaveAttachment() {
 	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
 
 	defer uuids.SetGenerator(uuids.DefaultGenerator)
-	uuids.SetGenerator(uuids.NewSeededGenerator(1234))
+	uuids.SetGenerator(uuids.NewSeededGenerator(1234, time.Now))
 
 	newURL, err := ts.b.SaveAttachment(ctx, knChannel, "image/jpeg", testJPG, "jpg")
 	ts.NoError(err)
-	ts.Equal("_test_storage/attachments/media/1/c00e/5d67/c00e5d67-c275-4389-aded-7d8b151cbd5b.jpg", newURL)
+	ts.Equal("http://localhost:9000/test-attachments/attachments/1/c00e/5d67/c00e5d67-c275-4389-aded-7d8b151cbd5b.jpg", newURL)
 }
 
 func (ts *BackendTestSuite) TestWriteMsg() {
@@ -1193,7 +1204,7 @@ func (ts *BackendTestSuite) TestWriteMsgWithAttachments() {
 	ctx := context.Background()
 
 	defer uuids.SetGenerator(uuids.DefaultGenerator)
-	uuids.SetGenerator(uuids.NewSeededGenerator(1234))
+	uuids.SetGenerator(uuids.NewSeededGenerator(1234, time.Now))
 
 	knChannel := ts.getChannel("KN", "dbc126ed-66bc-4e28-b67b-81dc3327c95d")
 	clog := courier.NewChannelLog(courier.ChannelLogTypeUnknown, knChannel, nil)
@@ -1215,7 +1226,7 @@ func (ts *BackendTestSuite) TestWriteMsgWithAttachments() {
 	// should have actually fetched and saved it to storage, with the correct content type
 	err = ts.b.WriteMsg(ctx, msg, clog)
 	ts.NoError(err)
-	ts.Equal([]string{"image/jpeg:_test_storage/attachments/media/1/9b95/5e36/9b955e36-ac16-4c6b-8ab6-9b9af5cd042a.jpg"}, msg.Attachments())
+	ts.Equal([]string{"image/jpeg:http://localhost:9000/test-attachments/attachments/1/9b95/5e36/9b955e36-ac16-4c6b-8ab6-9b9af5cd042a.jpg"}, msg.Attachments())
 
 	// try an invalid embedded attachment
 	msg = ts.b.NewIncomingMsg(knChannel, urn, "invalid embedded attachment data", "", clog).(*Msg)
@@ -1353,7 +1364,7 @@ func (ts *BackendTestSuite) TestMailroomEvents() {
 
 func (ts *BackendTestSuite) TestResolveMedia() {
 	ctx := context.Background()
-	rc := ts.b.redisPool.Get()
+	rc := ts.b.rp.Get()
 	defer rc.Close()
 
 	tcs := []struct {
@@ -1458,7 +1469,7 @@ func (ts *BackendTestSuite) TestResolveMedia() {
 }
 
 func (ts *BackendTestSuite) assertNoQueuedContactTask(contactID ContactID) {
-	rc := ts.b.redisPool.Get()
+	rc := ts.b.rp.Get()
 	defer rc.Close()
 
 	assertredis.ZCard(ts.T(), rc, "handler:1", 0)
@@ -1467,7 +1478,7 @@ func (ts *BackendTestSuite) assertNoQueuedContactTask(contactID ContactID) {
 }
 
 func (ts *BackendTestSuite) assertQueuedContactTask(contactID ContactID, expectedType string, expectedBody map[string]any) {
-	rc := ts.b.redisPool.Get()
+	rc := ts.b.rp.Get()
 	defer rc.Close()
 
 	assertredis.ZCard(ts.T(), rc, "handler:1", 1)
