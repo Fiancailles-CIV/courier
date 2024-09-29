@@ -19,17 +19,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/gomodule/redigo/redis"
 	"github.com/jmoiron/sqlx"
 	"github.com/nyaruka/courier"
 	"github.com/nyaruka/courier/queue"
 	"github.com/nyaruka/gocommon/analytics"
+	"github.com/nyaruka/gocommon/aws/dynamo"
+	"github.com/nyaruka/gocommon/aws/s3x"
 	"github.com/nyaruka/gocommon/cache"
 	"github.com/nyaruka/gocommon/dbutil"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/jsonx"
-	"github.com/nyaruka/gocommon/s3x"
 	"github.com/nyaruka/gocommon/syncx"
 	"github.com/nyaruka/gocommon/urns"
 	"github.com/nyaruka/gocommon/uuids"
@@ -55,13 +56,14 @@ type backend struct {
 	config *courier.Config
 
 	statusWriter *StatusWriter
-	dbLogWriter  *DBLogWriter      // unattached logs being written to the database
-	stLogWriter  *StorageLogWriter // attached logs being written to storage
+	dbLogWriter  *DBLogWriter     // unattached logs being written to the database
+	dyLogWriter  *DynamoLogWriter // all logs being written to dynamo
 	writerWG     *sync.WaitGroup
 
-	db *sqlx.DB
-	rp *redis.Pool
-	s3 *s3x.Service
+	db     *sqlx.DB
+	rp     *redis.Pool
+	dynamo *dynamo.Service
+	s3     *s3x.Service
 
 	channelsByUUID *cache.Local[courier.ChannelUUID, *Channel]
 	channelsByAddr *cache.Local[courier.ChannelAddress, *Channel]
@@ -128,6 +130,9 @@ func newBackend(cfg *courier.Config) courier.Backend {
 
 // Start starts our RapidPro backend, this tests our various connections and starts our spool flushers
 func (b *backend) Start() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// parse and test our redis config
 	log := slog.With("comp", "backend", "state", "starting")
 	log.Info("starting backend")
@@ -144,10 +149,7 @@ func (b *backend) Start() error {
 	b.db.SetMaxOpenConns(16)
 
 	// try connecting
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	err = b.db.PingContext(ctx)
-	cancel()
-	if err != nil {
+	if err := b.db.PingContext(ctx); err != nil {
 		log.Error("db not reachable", "error", err)
 	} else {
 		log.Info("db ok")
@@ -165,22 +167,28 @@ func (b *backend) Start() error {
 		queue.StartDethrottler(b.rp, b.stopChan, b.waitGroup, msgQueueName)
 	}
 
+	// setup DynamoDB
+	b.dynamo, err = dynamo.NewService(b.config.AWSAccessKeyID, b.config.AWSSecretAccessKey, b.config.AWSRegion, b.config.DynamoEndpoint, b.config.DynamoTablePrefix)
+	if err != nil {
+		return err
+	}
+	if err := b.dynamo.Test(ctx); err != nil {
+		log.Error("dynamodb not reachable", "error", err)
+	} else {
+		log.Info("dynamodb ok")
+	}
+
 	// setup S3 storage
 	b.s3, err = s3x.NewService(b.config.AWSAccessKeyID, b.config.AWSSecretAccessKey, b.config.AWSRegion, b.config.S3Endpoint, b.config.S3Minio)
 	if err != nil {
 		return err
 	}
 
-	// check bucket access
+	// check attachment bucket access
 	if err := b.s3.Test(ctx, b.config.S3AttachmentsBucket); err != nil {
 		log.Error("attachments bucket not accessible", "error", err)
 	} else {
 		log.Info("attachments bucket ok")
-	}
-	if err := b.s3.Test(ctx, b.config.S3LogsBucket); err != nil {
-		log.Error("logs bucket not accessible", "error", err)
-	} else {
-		log.Info("logs bucket ok")
 	}
 
 	// create and start channel caches...
@@ -210,8 +218,8 @@ func (b *backend) Start() error {
 	b.dbLogWriter = NewDBLogWriter(b.db, b.writerWG)
 	b.dbLogWriter.Start()
 
-	b.stLogWriter = NewStorageLogWriter(b.s3, b.config.S3LogsBucket, b.writerWG)
-	b.stLogWriter.Start()
+	b.dyLogWriter = NewDynamoLogWriter(b.dynamo, b.writerWG)
+	b.dyLogWriter.Start()
 
 	// register and start our spool flushers
 	courier.RegisterFlusher(path.Join(b.config.SpoolDir, "msgs"), b.flushMsgFile)
@@ -243,8 +251,8 @@ func (b *backend) Cleanup() error {
 	if b.dbLogWriter != nil {
 		b.dbLogWriter.Stop()
 	}
-	if b.stLogWriter != nil {
-		b.stLogWriter.Stop()
+	if b.dyLogWriter != nil {
+		b.dyLogWriter.Stop()
 	}
 
 	// wait for them to flush fully
@@ -633,7 +641,7 @@ func (b *backend) SaveAttachment(ctx context.Context, ch courier.Channel, conten
 
 	path := filepath.Join("attachments", strconv.FormatInt(int64(orgID), 10), filename[:4], filename[4:8], filename)
 
-	storageURL, err := b.s3.PutObject(ctx, b.config.S3AttachmentsBucket, path, contentType, data, s3.BucketCannedACLPublicRead)
+	storageURL, err := b.s3.PutObject(ctx, b.config.S3AttachmentsBucket, path, contentType, data, types.ObjectCannedACLPublicRead)
 	if err != nil {
 		return "", fmt.Errorf("error saving attachment to storage (bytes=%d): %w", len(data), err)
 	}

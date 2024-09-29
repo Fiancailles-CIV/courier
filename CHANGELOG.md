@@ -1,3 +1,71 @@
+v9.3.20 (2024-09-20)
+-------------------------
+ * Ignore */* as an attachment content type
+
+v9.3.19 (2024-09-18)
+-------------------------
+ * Stop writing channel logs to S3
+
+v9.3.18 (2024-09-12)
+-------------------------
+ * Use 'tasks:handler' queue name instead of 'handler'
+
+v9.3.17 (2024-09-12)
+-------------------------
+ * Write all channel logs to DynamoDB
+
+v9.3.16 (2024-09-11)
+-------------------------
+ * Use ordered v7 UUIDs for channel logs
+
+v9.3.15 (2024-09-11)
+-------------------------
+ * Add dynamodb support to backend
+
+v9.3.14 (2024-09-10)
+-------------------------
+ * Update TS channel type to use POST requests
+
+v9.3.13 (2024-09-09)
+-------------------------
+ * Never save attachments with empty content type
+
+v9.3.12 (2024-09-09)
+-------------------------
+ * Update to go 1.23
+ * Tidy up getting FCM credentials
+
+v9.3.11 (2024-09-04)
+-------------------------
+ * Use quick replies dumps of the options list and pass that as a string to FCM data
+
+v9.3.10 (2024-08-29)
+-------------------------
+ * No quick replies support for new FCM
+ * Cleanup unused variables
+
+v9.3.9 (2024-08-28)
+-------------------------
+ * Fix FCM message struct and token source initialization
+
+v9.3.8 (2024-08-26)
+-------------------------
+ * Merge pull request #773 from nyaruka/fix-FCM-fetch-token
+ * Adjust converting auth config to JSON
+
+v9.3.7 (2024-08-26)
+-------------------------
+ * Merge pull request #772 from nyaruka/fix-FCM-fetch-token
+ * Adjust FCM JSON config for getting token
+
+v9.3.6 (2024-08-22)
+-------------------------
+ * Fix context used during backend startup
+
+v9.3.5 (2024-08-22)
+-------------------------
+ * Update to aws-sdk-go-v2
+
 v9.3.4 (2024-08-07)
 -------------------------
  * Fix FCM authentication config retrieve to expect map[string]string

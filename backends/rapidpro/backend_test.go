@@ -15,14 +15,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/buger/jsonparser"
 	"github.com/gomodule/redigo/redis"
 	"github.com/lib/pq"
 	"github.com/nyaruka/courier"
 	"github.com/nyaruka/courier/queue"
 	"github.com/nyaruka/courier/test"
+	"github.com/nyaruka/courier/utils/clogs"
 	"github.com/nyaruka/gocommon/dbutil/assertdb"
 	"github.com/nyaruka/gocommon/httpx"
 	"github.com/nyaruka/gocommon/i18n"
@@ -50,43 +53,60 @@ func testConfig() *courier.Config {
 	config.AWSSecretAccessKey = "tembatemba"
 	config.S3Endpoint = "http://localhost:9000"
 	config.S3AttachmentsBucket = "test-attachments"
-	config.S3LogsBucket = "test-attachments"
 	config.S3Minio = true
+	config.DynamoEndpoint = "http://localhost:6000"
+	config.DynamoTablePrefix = "Test"
 
 	return config
 }
 
 func (ts *BackendTestSuite) SetupSuite() {
+	ctx := context.Background()
+
 	// turn off logging
 	log.SetOutput(io.Discard)
 
 	b, err := courier.NewBackend(testConfig())
-	if err != nil {
-		log.Fatalf("unable to create rapidpro backend: %v", err)
-	}
-	ts.b = b.(*backend)
+	noError(err)
 
-	err = ts.b.Start()
-	if err != nil {
-		log.Fatalf("unable to start backend for testing: %v", err)
-	}
+	ts.b = b.(*backend)
+	must(ts.b.Start())
 
 	// read our schema sql
 	sqlSchema, err := os.ReadFile("schema.sql")
-	if err != nil {
-		panic(fmt.Errorf("Unable to read schema.sql: %s", err))
-	}
+	noError(err)
 	ts.b.db.MustExec(string(sqlSchema))
 
 	// read our testdata sql
 	sql, err := os.ReadFile("testdata.sql")
-	if err != nil {
-		panic(fmt.Errorf("Unable to read testdata.sql: %s", err))
-	}
+	noError(err)
 	ts.b.db.MustExec(string(sql))
 
-	ts.b.s3.Client.CreateBucket(&s3.CreateBucketInput{Bucket: aws.String("test-attachments")})
-	ts.b.s3.Client.CreateBucket(&s3.CreateBucketInput{Bucket: aws.String("test-logs")})
+	ts.b.s3.Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("test-attachments")})
+	ts.b.s3.Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("test-logs")})
+
+	tablesFile, err := os.Open("dynamo.json")
+	noError(err)
+	defer tablesFile.Close()
+
+	tablesJSON, err := io.ReadAll(tablesFile)
+	noError(err)
+
+	inputs := []*dynamodb.CreateTableInput{}
+	jsonx.MustUnmarshal(tablesJSON, &inputs)
+
+	for _, input := range inputs {
+		input.TableName = aws.String(ts.b.dynamo.TableName(*input.TableName)) // add table prefix
+
+		// delete table if it exists
+		if _, err := ts.b.dynamo.Client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: input.TableName}); err == nil {
+			_, err := ts.b.dynamo.Client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: input.TableName})
+			must(err)
+		}
+
+		_, err := ts.b.dynamo.Client.CreateTable(ctx, input)
+		noError(err)
+	}
 
 	ts.clearRedis()
 }
@@ -506,7 +526,7 @@ func (ts *BackendTestSuite) TestMsgStatus() {
 	ts.True(m.ModifiedOn_.After(now))
 	ts.True(m.SentOn_.After(now))
 	ts.Equal(null.NullString, m.FailedReason_)
-	ts.Equal(pq.StringArray([]string{string(clog1.UUID())}), m.LogUUIDs)
+	ts.Equal(pq.StringArray([]string{string(clog1.UUID)}), m.LogUUIDs)
 
 	sentOn := *m.SentOn_
 
@@ -518,7 +538,7 @@ func (ts *BackendTestSuite) TestMsgStatus() {
 	ts.Equal(null.String("ext0"), m.ExternalID_) // no change
 	ts.True(m.ModifiedOn_.After(now))
 	ts.True(m.SentOn_.Equal(sentOn)) // no change
-	ts.Equal(pq.StringArray([]string{string(clog1.UUID()), string(clog2.UUID())}), m.LogUUIDs)
+	ts.Equal(pq.StringArray([]string{string(clog1.UUID), string(clog2.UUID)}), m.LogUUIDs)
 
 	// update to DELIVERED using id
 	clog3 := updateStatusByID(10001, courier.MsgStatusDelivered, "")
@@ -527,7 +547,7 @@ func (ts *BackendTestSuite) TestMsgStatus() {
 	ts.Equal(m.Status_, courier.MsgStatusDelivered)
 	ts.True(m.ModifiedOn_.After(now))
 	ts.True(m.SentOn_.Equal(sentOn)) // no change
-	ts.Equal(pq.StringArray([]string{string(clog1.UUID()), string(clog2.UUID()), string(clog3.UUID())}), m.LogUUIDs)
+	ts.Equal(pq.StringArray([]string{string(clog1.UUID), string(clog2.UUID), string(clog3.UUID)}), m.LogUUIDs)
 
 	// update to READ using id
 	clog4 := updateStatusByID(10001, courier.MsgStatusRead, "")
@@ -536,7 +556,7 @@ func (ts *BackendTestSuite) TestMsgStatus() {
 	ts.Equal(m.Status_, courier.MsgStatusRead)
 	ts.True(m.ModifiedOn_.After(now))
 	ts.True(m.SentOn_.Equal(sentOn)) // no change
-	ts.Equal(pq.StringArray([]string{string(clog1.UUID()), string(clog2.UUID()), string(clog3.UUID()), string(clog4.UUID())}), m.LogUUIDs)
+	ts.Equal(pq.StringArray([]string{string(clog1.UUID), string(clog2.UUID), string(clog3.UUID), string(clog4.UUID)}), m.LogUUIDs)
 
 	// no change for incoming messages
 	updateStatusByID(10002, courier.MsgStatusSent, "")
@@ -553,7 +573,7 @@ func (ts *BackendTestSuite) TestMsgStatus() {
 	ts.Equal(courier.MsgStatusFailed, m.Status_)
 	ts.True(m.ModifiedOn_.After(now))
 	ts.Nil(m.SentOn_)
-	ts.Equal(pq.StringArray([]string{string(clog5.UUID())}), m.LogUUIDs)
+	ts.Equal(pq.StringArray([]string{string(clog5.UUID)}), m.LogUUIDs)
 
 	now = time.Now().In(time.UTC)
 	time.Sleep(2 * time.Millisecond)
@@ -1036,6 +1056,14 @@ func (ts *BackendTestSuite) TestWriteChanneLog() {
 	assertdb.Query(ts.T(), ts.b.db, `SELECT channel_id, http_logs->0->>'url' AS url, errors->0->>'message' AS err FROM channels_channellog`).
 		Columns(map[string]any{"channel_id": int64(channel.ID()), "url": "https://api.messages.com/send.json", "err": "Unexpected response status code."})
 
+	// check that we can read the log back from DynamoDB
+	actualLog := &clogs.Log{}
+	err = ts.b.dynamo.GetItem(ctx, "ChannelLogs", map[string]types.AttributeValue{"UUID": &types.AttributeValueMemberS{Value: string(clog1.UUID)}}, actualLog)
+	ts.NoError(err)
+	ts.Equal(clog1.UUID, actualLog.UUID)
+	ts.Equal(courier.ChannelLogTypeTokenRefresh, actualLog.Type)
+	ts.Equal([]*clogs.LogError{courier.ErrorResponseStatusCode()}, actualLog.Errors)
+
 	clog2 := courier.NewChannelLog(courier.ChannelLogTypeMsgSend, channel, nil)
 	clog2.HTTP(trace)
 	clog2.SetAttached(true)
@@ -1046,10 +1074,12 @@ func (ts *BackendTestSuite) TestWriteChanneLog() {
 
 	time.Sleep(time.Second) // give writer time to write this
 
-	_, body, err := ts.b.s3.GetObject(context.Background(), ts.b.config.S3LogsBucket, fmt.Sprintf("channels/%s/%s/%s.json", channel.UUID(), clog2.UUID()[0:4], clog2.UUID()))
+	// check that we can read the log back from DynamoDB
+	actualLog = &clogs.Log{}
+	err = ts.b.dynamo.GetItem(ctx, "ChannelLogs", map[string]types.AttributeValue{"UUID": &types.AttributeValueMemberS{Value: string(clog2.UUID)}}, actualLog)
 	ts.NoError(err)
-	ts.Contains(string(body), "msg_send")
-	ts.Contains(string(body), "https://api.messages.com/send.json")
+	ts.Equal(clog2.UUID, actualLog.UUID)
+	ts.Equal(courier.ChannelLogTypeMsgSend, actualLog.Type)
 
 	ts.b.db.MustExec(`DELETE FROM channels_channellog`)
 
@@ -1472,8 +1502,8 @@ func (ts *BackendTestSuite) assertNoQueuedContactTask(contactID ContactID) {
 	rc := ts.b.rp.Get()
 	defer rc.Close()
 
-	assertredis.ZCard(ts.T(), rc, "handler:1", 0)
-	assertredis.ZCard(ts.T(), rc, "handler:active", 0)
+	assertredis.ZCard(ts.T(), rc, "tasks:handler:1", 0)
+	assertredis.ZCard(ts.T(), rc, "tasks:handler:active", 0)
 	assertredis.LLen(ts.T(), rc, fmt.Sprintf("c:1:%d", contactID), 0)
 }
 
@@ -1481,8 +1511,8 @@ func (ts *BackendTestSuite) assertQueuedContactTask(contactID ContactID, expecte
 	rc := ts.b.rp.Get()
 	defer rc.Close()
 
-	assertredis.ZCard(ts.T(), rc, "handler:1", 1)
-	assertredis.ZCard(ts.T(), rc, "handler:active", 1)
+	assertredis.ZCard(ts.T(), rc, "tasks:handler:1", 1)
+	assertredis.ZCard(ts.T(), rc, "tasks:handler:active", 1)
 	assertredis.LLen(ts.T(), rc, fmt.Sprintf("c:1:%d", contactID), 1)
 
 	data, err := redis.Bytes(rc.Do("LPOP", fmt.Sprintf("c:1:%d", contactID)))
@@ -1590,3 +1620,13 @@ func readChannelEventFromDB(b *backend, id ChannelEventID) *ChannelEvent {
 	}
 	return e
 }
+
+// convenience way to call a func and panic if it errors, e.g. must(foo())
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+// if just checking an error is nil noError(err) reads better than must(err)
+var noError = must

@@ -29,9 +29,11 @@ type Config struct {
 	AWSSecretAccessKey string `help:"secret access key to use for AWS services"`
 	AWSRegion          string `help:"region to use for AWS services, e.g. us-east-1"`
 
+	DynamoEndpoint    string `help:"DynamoDB service endpoint, e.g. https://dynamodb.us-east-1.amazonaws.com"`
+	DynamoTablePrefix string `help:"prefix to use for DynamoDB tables"`
+
 	S3Endpoint          string `help:"S3 service endpoint, e.g. https://s3.amazonaws.com"`
 	S3AttachmentsBucket string `help:"S3 bucket to write attachments to"`
-	S3LogsBucket        string `help:"S3 bucket to write channel logs to"`
 	S3Minio             bool   `help:"S3 is actually Minio or other compatible service"`
 
 	FacebookApplicationSecret    string `help:"the Facebook app secret"`
@@ -71,9 +73,11 @@ func NewDefaultConfig() *Config {
 		AWSSecretAccessKey: "",
 		AWSRegion:          "us-east-1",
 
+		DynamoEndpoint:    "", // let library generate it
+		DynamoTablePrefix: "Temba",
+
 		S3Endpoint:          "https://s3.amazonaws.com",
 		S3AttachmentsBucket: "temba-attachments",
-		S3LogsBucket:        "temba-logs",
 		S3Minio:             false,
 
 		FacebookApplicationSecret:    "missing_facebook_app_secret",
